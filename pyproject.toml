@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nd-basics"
+version = "0.1.0"
+description = "A simple demo project to guide me in learning modern Python app creation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Nick DeMarco" }
+]
+dependencies = ["click>=8.0"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5.0"
+]
