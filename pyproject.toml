@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nd-basics"
+name = "nd-wordlist-tools"
 version = "0.1.0"
-description = "A simple demo project to guide me in learning modern Python app creation"
+description = "Wordlist tools to generate convoluted, rules based passwords"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -19,3 +19,9 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5.0"
 ]
+
+[project.scripts]
+nd_caps = "nd_caps:main"
+nd_num2symbol = "nd_num2symbol:main"
+nd_interpose = "nd_interpose:main"
+nd_permute = "nd_permute:main"
