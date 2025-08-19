@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Pytest cache
+.cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+
+# MyPy, Pyright, and other static analysis tools
+.mypy_cache/
+.pyright/
+.pyre/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test / example artifacts
+*.tmp
+*.out
+examples/output_*.txt
+
+# Jupyter
+*.ipynb_checkpoints
+
+# Ignore corpus files unless explicitly added
+corpus.txt
+
+# Optional: ignore local config
+local_settings.py
