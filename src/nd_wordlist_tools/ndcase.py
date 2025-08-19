@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nd_caps — patterned capitalization generator for two-word pairs.
+ndcase — patterned capitalization generator for two-word pairs.
 
 MVP features implemented:
 
@@ -415,7 +415,7 @@ def log_plan(
 
 # ---------------------------------- CLI ------------------------------------ #
 
-app = typer.Typer(add_completion=False, help="nd_caps — patterned capitalization generator.")
+app = typer.Typer(add_completion=False, help="nd_case — patterned capitalization generator.")
 
 
 def _open_in(path: Optional[Path]) -> Iterable[str]:
@@ -517,7 +517,7 @@ def run(
     ),
 ) -> None:
     """
-    Generate capitalization variants for two-word pairs using the nd_caps DSL.
+    Generate capitalization variants for two-word pairs using the DSL.
 
     DSL:
       RULE := [w1:|w2:]U(start,len)
