@@ -1,40 +1,124 @@
 #!/usr/bin/env python3
-"""nd_num2symbols — Seed-preserving symbol insertion generator.
-
-Form:
-    <seed> -> <action>
-
-SEED:
-    @<digits>               Literal digits (e.g., @12)
-    #range(a..b)             Inclusive numeric range, equal width (e.g., #range(0000..9999))
-    #mask(<mask>)            Mask subset (?d or ?{<digits>} per position)
-
-ACTION:
-    Space-separated sequence of layouts:
-      D       digits in order
-      D~      digits reversed
-      S       shifted symbols in order
-      S~      shifted symbols reversed
-      zip(ds) interleave digit, symbol pairs
-      zip(sd) interleave symbol, digit pairs
-      zip(d s~) zip digits with reversed symbols
-      zip(s~ d) zip reversed symbols with digits
-
-SHIFT MAPPING:
-    1→!  2→@  3→#  4→$  5→%  6→^  7→&  8→*  9→(  0→)
-
-EXAMPLES:
-    nd_num2symbols run "@12 -> D S"      # 12!@
-    nd_num2symbols run "@12 -> S D"      # !@12
-    nd_num2symbols run "@12 -> D S~"     # 12@!
-    nd_num2symbols run "@12 -> zip(ds)"  # 1!2@
-    nd_num2symbols run "@12 -> zip(sd)"  # !1@2
-
-Flags:
-    --dsl-help            Print a concise DSL syntax guide and exit.
-
-Deterministic: same input → same output order.
 """
+ndfillgen — deterministic generator for digit/symbol “fill” sequences.
+
+PURPOSE
+    Produce short “fill” strings (digits and/or their shifted-symbol counterparts)
+    from a compact, human-readable DSL. The output is a pure stream of fills
+    suitable for piping into ndcombine (which actually inserts them between/around
+    words) or directly into a cracking engine.
+
+KEY IDEAS
+    • Determinism: identical inputs and DSL yield the same sequence order forever.
+    • Compact notation: a single DSL line can describe a very large fill keyspace.
+    • Splittable keyspace: supports --start-index/--count for chunked/distributed runs.
+
+DIGIT → SHIFTED-SYMBOL MAP
+    1→!   2→@   3→#   4→$   5→%   6→^   7→&   8→*   9→(   0→)
+
+DSL OVERVIEW
+    Form (per line):
+        <SEED>  "->"  <ACTION-LIST>
+
+    SEED (choose one):
+        @<digits>            Literal digit seed (e.g., @56)
+        #range(a..b)         Inclusive numeric range, zero-padded to max width
+                             (e.g., #range(01..12) → 01,02,…,12)
+        #mask(<mask>)        Mask per position using ?d or a digit set {…}
+                             (e.g., #mask(?d?d) or #mask({12}{39}{07}))
+    ACTION-LIST:
+        Space-separated layouts; each layout expands SEED into one or more fills.
+        Layout keywords:
+          D        digits in original order
+          D~       digits reversed
+          S        shifted symbols for the digits (map above), in original order
+          S~       shifted symbols reversed
+          zip(ds)  interleave digit, symbol → d1,s1,d2,s2,…
+          zip(sd)  interleave symbol, digit → s1,d1,s2,d2,…
+          zip(d s~)   interleave digits with REVERSED symbols
+          zip(s~ d)   interleave REVERSED symbols with digits
+
+    EXAMPLES
+        @56 -> D
+            emits: 56
+
+        @56 -> S
+            emits: ^@
+
+        @56 -> D S zip(ds) zip(sd)
+            emits: 56
+                   ^@
+                   5^6@
+                   ^5@6
+
+        #range(10..12) -> D S
+            emits: 10 11 12
+                   )! !! @!
+
+        #mask({12}{39}{07}) -> zip(ds)
+            positions:
+              p1 ∈ {1,2}, p2 ∈ {3,9}, p3 ∈ {0,7}
+            emits all zipped (digit,symbol) interleavings for each 3‑digit choice.
+
+COMMAND-LINE (typical)
+    ndfillgen [OPTIONS]
+      Reads DSL lines from stdin (or --in) and writes fills to stdout (or --out).
+      Each non-empty, non-comment line must be a single "<SEED> -> <ACTION-LIST>".
+
+OPTIONS (proposed/typical)
+    --in PATH            Read DSL from file instead of stdin
+    --out PATH           Write fills to file instead of stdout
+    --start-index N      Skip first N fills in the global enumeration (for sharding)
+    --count K            Emit at most K fills (for sharding)
+    --dedupe             Suppress duplicate fills within the run
+    --quiet              Suppress progress to stderr
+
+DETERMINISTIC ORDERING
+    For each DSL line:
+      1) Expand SEED to a list of digit sequences in a fixed, documented order:
+         - @<digits>: single sequence (verbatim)
+         - #range(a..b): numeric ascending, left‑padded to max width
+         - #mask(...): cartesian product in position order; within each position:
+                       digits appear in ascending ASCII order (0..9) unless an
+                       explicit set {…} is given; sets iterate in the user’s order
+      2) For each sequence, expand ACTION-LIST left→right. For “zip(…)” forms,
+         the first argument is emitted first in each pair.
+      3) Concatenate per-line outputs in file order.
+
+SPLITTING (RANK/UNRANK)
+    The generator maintains a global, zero-based index over the emitted fills.
+    With --start-index S and --count C, ndfillgen emits the half-open range
+    [S, S+C). This enables distributed runs and precise logging of tried ranges.
+
+EXIT CODES
+    0 = success
+    non-zero = parse or runtime error
+
+NOTES
+    • Lines beginning with "#" are comments and ignored.
+    • Blank lines are ignored.
+    • Inputs should be UTF-8; outputs are LF-terminated ASCII.
+
+EXTRA EXAMPLES
+    # two digits, both orders, plus their symbols
+    @12 -> D D~ S S~
+      → 12, 21, !@, @!
+
+    # “shifted-only” fills for all 2-digit numbers 00..99
+    #range(00..99) -> S
+
+    # mix of seeds and layouts in one file
+    @56 -> zip(ds) S
+    #mask(?d?d) -> D
+    #range(7..9) -> zip(sd)
+
+IMPLEMENTATION HINTS (internal)
+    • Keep the digit→symbol map table local and immutable.
+    • Use generators to stream; avoid materializing large expansions.
+    • Unit-test: seed expansion, each layout, and ordering; goldens for rank/unrank.
+
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -455,8 +539,8 @@ def cli_run(
     """Expand the DSL program and print each output line to stdout.
 
     Example:
-        nd_num2symbols run "@12 -> D S"    # prints: 12!@
-        nd_num2symbols run "#mask(?d?d) -> zip(ds)"  # prints 100 lines
+        ndfillgen run "@12 -> D S"    # prints: 12!@
+        ndfillgen run "#mask(?d?d) -> zip(ds)"  # prints 100 lines
     """
     try:
         seed_spec, action = parse_program(program)

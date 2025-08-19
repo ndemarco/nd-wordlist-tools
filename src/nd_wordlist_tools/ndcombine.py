@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nd_interpose — insert fills between word pairs (one pair per line).
+ndcombine — assembles phrase from words and fills.
 
 INPUTS
 ------
@@ -17,13 +17,13 @@ For each line in pairs:
 EXAMPLES
 --------
 # Insert all fills between each pair
-nd_interpose --pairs pairs.txt --fills fills.txt > out.txt
+ndcombine --pairs pairs.txt --fills fills.txt > out.txt
 
 # Fills from stdin
-cat fills.txt | nd_interpose -p pairs.txt -f - > out.txt
+cat fills.txt | ndcombine -p pairs.txt -f - > out.txt
 
 # Stats only (don’t print candidates, just count)
-nd_interpose -p pairs.txt -f fills.txt --stats-only
+ndcombine -p pairs.txt -f fills.txt --stats-only
 
 DESIGN
 ------
