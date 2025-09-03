@@ -24,10 +24,9 @@ def generate_pairs(
     Priority is defined by list position in the combined corpus,
     with all base words first, then extra words.
 
-    Rules:
-    - If extra corpus is given: only yield pairs where at least
-      one word comes from extra.
-    - If extra corpus is not given: generate pairs from base alone.
+    Avoid emitting duplicates. If extra corpus is given: only yield pairs where at least
+      one word comes from the extra corpus.
+   
     """
     if extra:
         combined = base + extra
@@ -79,14 +78,14 @@ def main(
     ),
     unique: bool = typer.Option(
         False, "--unique", "-u",
-        help="Drop pairs where word1 == word2"
+        help="Skip pairs where word1 == word2"
     ),
 ):
     """
-    Generate word pairs according to the given patterns.
+    Add command API to generate word pairs according to the given patterns.
 
-    - If extra corpus is given: Only produce pairs where at least one word is from the extra corpus.
-    - If only base corpus is given: Produce pairs from base corpus alone.
+    Produce pairs from base corpus. If an extra corpus is provided, only produce pairs
+    where at least one word is from the extra corpus.
     """
     # Read corpora
     base_words = [w for line in base_corpus for w in line.strip().split() if w]
