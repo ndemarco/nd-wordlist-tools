@@ -3,15 +3,8 @@
 ndfillgen — deterministic generator for digit/symbol “fill” sequences.
 
 PURPOSE
-    Produce short “fill” strings (digits and/or their shifted-symbol counterparts)
-    from a compact, human-readable DSL. The output is a pure stream of fills
-    suitable for piping into ndcombine (which actually inserts them between/around
-    words) or directly into a cracking engine.
-
-KEY IDEAS
-    • Determinism: identical inputs and DSL yield the same sequence order forever.
-    • Compact notation: a single DSL line can describe a very large fill keyspace.
-    • Splittable keyspace: supports --start-index/--count for chunked/distributed runs.
+    Produce short “fill” strings (digits and/or their shifted-symbol counterparts).
+    The output is a pure stream of fill strings.
 
 DIGIT → SHIFTED-SYMBOL MAP
     1→!   2→@   3→#   4→$   5→%   6→^   7→&   8→*   9→(   0→)
@@ -39,23 +32,23 @@ DSL OVERVIEW
           zip(s~ d)   interleave REVERSED symbols with digits
 
     EXAMPLES
-        @56 -> D
+        -s @56 -a D
             emits: 56
 
-        @56 -> S
+        -s @56 -a S
             emits: ^@
 
-        @56 -> D S zip(ds) zip(sd)
+        -s @56 -a D S zip(ds) zip(sd)
             emits: 56
                    ^@
                    5^6@
                    ^5@6
 
-        #range(10..12) -> D S
+        -s #range(10..12) -a D S
             emits: 10 11 12
                    )! !! @!
 
-        #mask({12}{39}{07}) -> zip(ds)
+        -s #mask({12}{39}{07}) -a zip(ds)
             positions:
               p1 ∈ {1,2}, p2 ∈ {3,9}, p3 ∈ {0,7}
             emits all zipped (digit,symbol) interleavings for each 3‑digit choice.
@@ -122,16 +115,13 @@ IMPLEMENTATION HINTS (internal)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generator, Iterable, Iterator, List, Sequence, Tuple
+from typing import Iterator, List, Sequence, Tuple
+from enum import Enum
 import re
 import sys
 import typer
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
-
-# -----------------------------
-# Errors
-# -----------------------------
 
 
 class DSLParseError(ValueError):
@@ -142,10 +132,7 @@ class DSLSemanticError(ValueError):
     """Raised when a DSL string is syntactically valid but semantically invalid."""
 
 
-# -----------------------------
 # Symbol mapping
-# -----------------------------
-
 _DIGIT_TO_SHIFT = {
     "1": "!",
     "2": "@",
@@ -162,25 +149,12 @@ _DIGIT_TO_SHIFT = {
 
 def shift_of_digit(d: str) -> str:
     """Return the shifted number-row symbol for a single digit.
-
-    Args:
-        d: A single character in '0'..'9'.
-
-    Returns:
-        The corresponding shifted symbol.
-
-    Raises:
-        ValueError: if *d* is not a digit.
     """
     try:
         return _DIGIT_TO_SHIFT[d]
-    except KeyError as exc:  # pragma: no cover - defensive
+    except KeyError as exc:  # digit not found
         raise ValueError(f"Not a digit: {d!r}") from exc
     
-
-# --- DSL help wiring -------------------------------------------------------
-import typer
-
 def _dsl_help_text() -> str:
     """Return a concise DSL syntax guide for --dsl-help.
 
@@ -200,26 +174,20 @@ def _dsl_help_text() -> str:
         "SHIFT MAP:\n"
         "  1→! 2→@ 3→# 4→$ 5→% 6→^ 7→& 8→* 9→( 0→)\n\n"
         "EXAMPLES:\n"
-        "  nd_num2symbols run \"@12 -> D S\"      # 12!@\n"
-        "  nd_num2symbols run \"@12 -> S D\"      # !@12\n"
-        "  nd_num2symbols run \"@12 -> D S~\"     # 12@!\n"
-        "  nd_num2symbols run \"@12 -> zip(ds)\"  # 1!2@\n"
-        "  nd_num2symbols run \"@12 -> zip(sd)\"  # !1@2\n"
+        "  ndfillgen run \"@12 -> D S\"      # 12!@\n"
+        "  ndfillgen run \"@12 -> S D\"      # !@12\n"
+        "  ndfillgen run \"@12 -> D S~\"     # 12@!\n"
+        "  ndfillgen run \"@12 -> zip(ds)\"  # 1!2@\n"
+        "  ndfillgen run \"@12 -> zip(sd)\"  # !1@2\n"
     )
-
-# -----------------------------
-# Seed specifications
-# -----------------------------
 
 
 @dataclass(frozen=True)
 class SeedSpec:
     """Specification for generating seed digit strings.
-
-    Exactly one of the fields is populated.
     """
 
-    literal: str | None = None
+    # Exactly one field is populated.
     range_start: str | None = None
     range_end: str | None = None
     mask_tokens: Tuple[str, ...] | None = None  # tokens like '?d' or '?{12}'
@@ -230,10 +198,7 @@ class SeedSpec:
         Yields:
             Strings composed solely of digits '0'..'9'.
         """
-        if self.literal is not None:
-            yield self.literal
-            return
-
+ 
         if self.range_start is not None and self.range_end is not None:
             a, b = self.range_start, self.range_end
             if len(a) != len(b):
@@ -327,18 +292,22 @@ def _expand_mask_tokens(tokens: Sequence[str]) -> Iterator[str]:
             stack.append((idx + 1, acc + [ch]))
 
 
-# -----------------------------
-# Action parsing
-# -----------------------------
-
-
 @dataclass(frozen=True)
 class Layout:
-    kind: str  # 'D', 'S', or 'ZIP'
+    
+    kind: LayoutKind
+    reverse: bool = False
+    zip_left: Tuple[str, bool] | None = None
+    zip_right: Tuple[str, bool] | None = None
     reverse: bool = False
     # For ZIP only
     zip_left: Tuple[str, bool] | None = None  # ('d'|'s', reversed)
     zip_right: Tuple[str, bool] | None = None
+
+class LayoutKind(Enum):
+    DIGITS = "D"
+    SYMBOLS = "S"
+    ZIP = "ZIP"
 
 
 @dataclass(frozen=True)
@@ -347,62 +316,54 @@ class Action:
 
 
 _SEED_RE = re.compile(
-    r"^\s*(?:@(?P<lit>[0-9]+)|#range\((?P<a>[0-9]+)\.\.(?P<b>[0-9]+)\)|#mask\((?P<mask>[^)]*)\))\s*$"
+    r"""
+    ^\s*
+    (?:
+        range\(
+            (?P<a>[0-9]+)
+            \.\.
+            (?P<b>[0-9]+)
+        \)
+        |
+        mask\(
+            (?P<mask>[^)]*)
+        \)
+    )\s*$
+    """,
+    re.VERBOSE
 )
 
 
-def parse_program(program: str) -> Tuple[SeedSpec, Action]:
-    """Parse a full DSL program of the form ``<seed> -> <action>``.
 
-    Args:
-        program: The input DSL string.
+def parse_seed(seed_str: str) -> SeedSpec:
+    """ Parse the seed spec. Match on regex groups."""
 
-    Returns:
-        (SeedSpec, Action)
-
-    Raises:
-        DSLParseError: on syntax errors.
-    """
-    if "->" not in program:
-        raise DSLParseError("program must contain '->'")
-    seed_str, action_str = program.split("->", 1)
-    seed_str = seed_str.strip()
-    action_str = action_str.strip()
-
-    # Seed
-    m = _SEED_RE.match(seed_str)
-    if not m:
-        raise DSLParseError("invalid seed; expected @<digits>, #range(a..b), or #mask(…) ")
-    if m.group("lit") is not None:
-        seed = SeedSpec(literal=m.group("lit"))
-    elif m.group("a") is not None and m.group("b") is not None:
-        seed = SeedSpec(range_start=m.group("a"), range_end=m.group("b"))
-    else:
-        mask_inner = m.group("mask") or ""
-        tokens = parse_mask(mask_inner)
-        seed = SeedSpec(mask_tokens=tokens)
-
-    action = parse_action(action_str)
-    return seed, action
+    match = _SEED_RE.match(seed_str.strip())
+    
+    if not match:
+        raise DSLParseError("invalid seed")
+    
+    # literal
+    if match.group("lit") is not None:
+        return SeedSpec(literal=match.group("lit"))
+    
+    # range
+    if match.group("a") is not None and match.group("b") is not None:
+        return SeedSpec(range_start=match.group("a"), range_end=match.group("b"))
+    
+    # mask
+    tokens = parse_mask(match.group("mask") or "")
+    return SeedSpec(mask_tokens=tokens)
 
 
 def parse_action(action: str) -> Action:
-    """Parse the action (layouts) portion.
-
-    Args:
-        action: Layout sequence, e.g. "D S~", "zip(ds)", "S D".
-
-    Returns:
-        Action object.
-
-    Raises:
-        DSLParseError: if any layout token is invalid.
-    """
+    """Parse actions directives."""
+    
     parts = [p for p in action.strip().split() if p]
     if not parts:
         raise DSLParseError("action is empty")
 
-    layouts: List[Layout] = []
+    layouts = []
     for p in parts:
         if p in ("D", "D~", "S", "S~"):
             kind = p[0]
@@ -422,10 +383,10 @@ def parse_action(action: str) -> Action:
 
 
 def _parse_zip_spec(spec: str) -> Tuple[Tuple[str, bool], Tuple[str, bool]]:
-    """Parse the specification inside ``zip( … )``.
+    """Parse the directives inside ``zip( … )``.
 
-    Accepts either compact forms (e.g., "ds", "d~s", "sd~") or spaced
-    forms (e.g., "d s~").
+    Accepts compact forms (e.g., "ds", "d~s", "sd~")
+    and spaced forms (e.g., "d s~").
 
     Returns:
         ((left_kind, left_rev), (right_kind, right_rev)) where kind in {'d','s'}.
@@ -457,28 +418,12 @@ def _parse_zip_spec(spec: str) -> Tuple[Tuple[str, bool], Tuple[str, bool]]:
     return tokens[0], tokens[1]
 
 
-# -----------------------------
-# Action evaluation
-# -----------------------------
-
-
 def evaluate_action(digits: str, action: Action) -> str:
-    """Apply an Action to a seed digit string.
+    """Apply an Action to a seed digit string."""
+    d_stream = digits
+    s_stream = "".join(shift_of_digit(ch) for ch in digits)
+    out_parts: list[str] = []
 
-    The seed digits are preserved except where a layout explicitly reverses the
-    digits stream via ``D~`` or uses interleaving via ``zip``.
-
-    Args:
-        digits: The seed digit string.
-        action: Parsed action.
-
-    Returns:
-        The resulting output string for this seed.
-    """
-    d_stream = list(digits)
-    s_stream = [shift_of_digit(ch) for ch in d_stream]
-
-    out_parts: List[str] = []
     for layout in action.layouts:
         if layout.kind == "D":
             seq = d_stream[::-1] if layout.reverse else d_stream
@@ -511,67 +456,53 @@ def _select_stream(d_stream: Sequence[str], s_stream: Sequence[str], spec: Tuple
     return list(reversed(base)) if rev else list(base)
 
 
-# -----------------------------
-# CLI
-# -----------------------------
-
-
 @app.callback(invoke_without_command=True)
 def _root(  # type: ignore[unused-argument]
-    dsl_help: bool = typer.Option(
+    help: bool = typer.Option(
         False,
-        "--dsl-help",
-        help="Show DSL syntax help and exit.",
+        "--help",
+        help="Show help and exit.",
     ),
 ):
-    """Root CLI callback. Use --dsl-help to print the DSL quick reference."""
-    if dsl_help:
+    """Root CLI callback. Use --help to print a quick reference."""
+    if help:
         typer.echo(_dsl_help_text())
         raise typer.Exit(0)
 
 
 @app.command("run")
 def cli_run(
-    program: str = typer.Argument(
-        ..., help="DSL program: '<seed> -> <action>' (quote to preserve spaces)"
-    ),
+    seed: str | None = typer.Option(None, "-s", "--seed", help="Seed spec: @<digits> | #mask(...) | #range(a..b)"),
+    action: str | None = typer.Option(None, "-a", "--action", help="Action spec: e.g. D S zip(ds)"),
 ) -> None:
-    """Expand the DSL program and print each output line to stdout.
-
-    Example:
-        ndfillgen run "@12 -> D S"    # prints: 12!@
-        ndfillgen run "#mask(?d?d) -> zip(ds)"  # prints 100 lines
-    """
+    """Expand the DSL program and print each output line to stdout."""
     try:
-        seed_spec, action = parse_program(program)
-        for seed in seed_spec.expand():
-            out = evaluate_action(seed, action)
+        # No seed and no action: treat as a usage error to avoid surprising no-op
+        if seed is None and action is None:
+            raise DSLParseError("nothing to do: provide --seed, --action, or both")
+
+        # Only action: explicit no-op (print nothing, success)
+        if seed is None and action is not None:
+            raise typer.Exit(code=0)
+
+        # From here on, seed is present
+        seed_spec = parse_seed(seed or "")
+
+        # If no action, emit the seed(s) as-is (equivalent to D)
+        if action is None:
+            for s in seed_spec.expand():
+                sys.stdout.write(s + "\n")
+            return
+
+        # Both seed and action provided: normal path
+        act = parse_action(action)
+        for s in seed_spec.expand():
+            out = evaluate_action(s, act)
             sys.stdout.write(out + "\n")
+
     except (DSLParseError, DSLSemanticError) as e:
         typer.secho(f"error: {e}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=2)
-
-
-@app.command("keyspace")
-def cli_keyspace(
-    seed: str = typer.Argument(..., help="Seed only: @<digits> | #mask(...) | #range(a..b)"),
-) -> None:
-    """Print the number of seed expansions for a seed specification.
-
-    This does not inspect the action because layouts do not change cardinality.
-    """
-    # Reuse the seed parser by composing a dummy action (ignored here)
-    try:
-        seed_spec, _ = parse_program(f"{seed} -> D")
-    except DSLParseError as e:
-        typer.secho(f"error: {e}", err=True, fg=typer.colors.RED)
-        raise typer.Exit(code=2)
-
-    # Count lazily but efficiently; avoid consuming massive memory.
-    count = 0
-    for _ in seed_spec.expand():
-        count += 1
-    typer.echo(str(count))
 
 
 def main() -> None:  # pragma: no cover - thin wrapper
