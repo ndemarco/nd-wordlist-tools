@@ -1,512 +1,348 @@
 #!/usr/bin/env python3
 """
-ndcase — patterned capitalization generator for two-word pairs.
+ndcase — shell-safe capitalization variant generator for two-word pairs.
 
-MVP features implemented:
+DSL v2 (shell-safe):
+  [WORDSEL:]OP:START,LEN
+    WORDSEL ∈ { w1, w2, w* }   (default: w*)
+    OP      ∈ { U }            (U = generate all case permutations over span)
+    START   ∈ int
+              • Positive values count from the left (1 = first character).
+              • Negative values count from the right (-1 = last character).
+              • 0 is invalid.
+    LEN     ∈ int > 0
 
-- DSL of directives: [w1:|w2:]U(start,len)
-  * If no word selector is given, the directive applies to BOTH words (expanded internally).
-  * start >= 0 counts from the left; start < 0 counts from the right (-1 is last char).
-  * len ≥ 1; each directive generates all case permutations within that span (2^len variants,
-    including the all-lowercase mask).
+Examples:
+  U:1,3         # both words: positions 1–3 (inclusive range in human terms)
+  w1:U:-3,2     # word 1 only: last 3rd and 2nd chars
+  w2:U:5,1      # word 2 only: 5th char
 
-- Per-line, per-word normalization for the actual word length s:
-  * Convert right-anchored starts to left indices (s - k), clip to bounds,
-    merge duplicate starts by keeping the largest max_len.
-  * Build a plan of (start, max_len) entries sorted by start.
-  * Cache plans by (target, s) for reuse across words of the same length.
+Multiple directives can be provided separated by spaces on the CLI or by newlines
+in a rules file (lines starting with '#' are comments). Legacy syntax is not accepted.
 
-- Streaming I/O: reads stdin or --in; writes stdout or --out.
-- Deterministic enumeration order:
-  * For each start (ascending), iterate masks 0..(2^span-1) in ascending order before moving to the next start.
-  * If both words have variants, emit the cross product in a stable nested order.
+Input:
+  Lines of two whitespace-separated words, e.g., "hello world".
 
-- Stats and logging:
-  * --stats-only prints JSON stats (no candidates).
-  * -v / --verbose prints plan builds/cache-hits to stderr (one log per new (target,s)).
-  * Skipped spans (out-of-bounds/clipped-to-zero) counted per plan build.
+Output:
+  All capitalization variants for each input line as directed by rules.
 
-- Dedup/progress:
-  * Optional in-run memory dedup: --dedup-memory (per-process set).
-  * Optional persistent dedup across runs: --seen-db PATH (SQLite, stdlib).
-    Candidates already present are not re-emitted (and counted as duplicates_suppressed).
-
-Requirements: Python 3.10+, Typer (CLI). Everything else is stdlib.
+CLI:
+  -r/--rule RULE        Repeatable rule option.
+  --rules-file PATH     Load rules from a file (one per line; '#' for comments).
+  -i/--in FILE          Input file (default: stdin).
+  -o/--out PATH         Output file (default: stdout).
+  --dedup-memory        In-run memory dedup (per-process set).
+  --seen-db PATH        SQLite database to persist seen candidates (skip re-emits).
 """
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import typer
 
-# ----------------------------- Data structures ----------------------------- #
-
-
-@dataclass(frozen=True)
-class Family:
-    """
-    A directive family before normalization to a particular word length.
-
-    anchor:
-        'L' if anchored from the left (start >= 0 in the DSL),
-        'R' if anchored from the right (start < 0 in the DSL).
-
-    start:
-        Non-negative position parameter. For 'L', it's the left index a (0-based).
-        For 'R', it's the right offset b (i.e., original DSL start was -b).
-
-    len_max:
-        Maximum run length implied by this family (all 1..len_max are allowed).
-    """
-
-    anchor: str  # 'L' or 'R'
-    start: int
-    len_max: int
-
-
-@dataclass(frozen=True)
-class PlanEntry:
-    """
-    A normalized, per-length plan entry for a word of length s.
-
-    start:
-        Left-anchored start index (0-based) within the word.
-
-    len_max:
-        Maximum run length that remains in-bounds for this start.
-    """
-
-    start: int
-    len_max: int
-
-
-@dataclass
-class Stats:
-    """Aggregated runtime statistics."""
-
-    lines_total: int = 0
-    lines_valid: int = 0
-    lines_invalid: int = 0
-    skipped_spans: int = 0  # during plan building
-    duplicates_suppressed: int = 0  # due to seen store or in-run dedup
-    variants_total_emitted: int = 0
-    max_variants_per_line: int = 0
-    max_variants_line_index: Optional[int] = None
-    duration_ms: float = 0.0
-    plans_built: int = 0
-    plans_cache_hits: int = 0
-
-
-# ----------------------------- Parsing & DSL ------------------------------- #
-
-RULE_RE = re.compile(
-    r"""^(?:(?P<target>w1|w2)\s*:\s*)?U\(\s*(?P<start>-?\d+)\s*,\s*(?P<len>\d+)\s*\)$""",
-    re.IGNORECASE,
+app = typer.Typer(
+    add_completion=False,
+    help="Generate capitalization variants for two-word pairs using the DSL.",
 )
 
+# ---------- DSL parsing ----------
 
-class CLIError(typer.BadParameter):
-    """CLI-friendly exception for argument/DSL issues."""
+# Strict, no legacy accepted.
+DIRECTIVE_RE = re.compile(r"^(?:(w[12]|w\*)\:)?([A-Za-z])\:(-?\d+),(\d+)$")
+
+# ---------- Data structures / naming ----------
+
+WordSel = str  # 'w1', 'w2', 'w*'
 
 
-def parse_rule(rule: str) -> Tuple[Optional[str], Family]:
-    """
-    Parse a single DSL rule like "U(1,5)" or "w1:U(-3,2)".
+@dataclass(frozen=True)
+class Directive:
+    wordsel: WordSel  # 'w1' | 'w2' | 'w*'
+    op: str  # currently 'U'
+    start: int  # signed
+    length: int  # > 0
 
-    Returns:
-        (target, Family)
-        target is 'w1' | 'w2' | None (None means applies to both and will be expanded by the caller)
-    """
-    m = RULE_RE.match(rule.strip())
+
+@dataclass(frozen=True)
+class DirectiveFamily:
+    """Group of directives with same op, keyed by selector."""
+
+    op: str
+    spans_w1: Tuple[Tuple[int, int], ...]  # (start, length) after binding/normalization
+    spans_w2: Tuple[Tuple[int, int], ...]
+
+
+def parse_directive(text: str) -> Directive:
+    """Parse a single directive in v2 DSL form."""
+    m = DIRECTIVE_RE.match(text.strip())
     if not m:
-        raise CLIError(f"Invalid directive syntax: {rule!r}")
-    target = m.group("target")
-    start_i = int(m.group("start"))
-    len_max = int(m.group("len"))
-    if len_max < 1:
-        raise CLIError(f"len must be >= 1 in {rule!r}")
-
-    if start_i >= 0:
-        fam = Family(anchor="L", start=start_i, len_max=len_max)
-    else:
-        k = -start_i
-        if k < 1:
-            # This case can't happen since start_i < 0 implies k >= 1
-            raise CLIError(f"Invalid negative start in {rule!r}")
-        fam = Family(anchor="R", start=k, len_max=len_max)
-
-    return (target.lower() if target else None, fam)
-
-
-def expand_targets(
-    parsed: Sequence[Tuple[Optional[str], Family]]
-) -> Tuple[List[Family], List[Family]]:
-    """
-    Expand target=None families to both w1 and w2.
-
-    Returns:
-        (families_w1, families_w2)
-    """
-    w1: List[Family] = []
-    w2: List[Family] = []
-    for tgt, fam in parsed:
-        if tgt is None:
-            w1.append(fam)
-            w2.append(fam)
-        elif tgt.lower() == "w1":
-            w1.append(fam)
-        elif tgt.lower() == "w2":
-            w2.append(fam)
-        else:
-            raise CLIError(f"Unknown target: {tgt!r}")
-    return w1, w2
+        raise typer.BadParameter(
+            f"Invalid directive '{text}'. Expected [w1|w2|w*:]OP:START,LEN (e.g., 'U:1,3' or 'w1:U:-3,2')."
+        )
+    wordsel, op, start_s, len_s = m.groups()
+    wordsel = wordsel or "w*"
+    if wordsel not in {"w1", "w2", "w*"}:
+        raise typer.BadParameter(f"WORDSEL must be w1, w2, or w*; got '{wordsel}'.")
+    if op not in {"U"}:
+        raise typer.BadParameter(f"Unknown op '{op}'. Supported: U")
+    try:
+        start = int(start_s)
+        length = int(len_s)
+    except ValueError:
+        raise typer.BadParameter(
+            f"START and LEN must be integers; got '{start_s},{len_s}'."
+        )
+    if length <= 0:
+        raise typer.BadParameter(f"LEN must be > 0; got {length}.")
+    return Directive(wordsel=wordsel, op=op, start=start, length=length)
 
 
-def collapse_families(families: Sequence[Family]) -> List[Family]:
-    """
-    Compile-time dedup: for identical (anchor, start), keep only the largest len_max.
-
-    This is safe because U(start, Lmax) implies all U(start, l) for l in 1..Lmax
-    for the same anchor. Cross-anchor cannot be collapsed without knowing s.
-    """
-    best: Dict[Tuple[str, int], int] = {}
-    for fam in families:
-        key = (fam.anchor, fam.start)
-        prev = best.get(key)
-        if prev is None or fam.len_max > prev:
-            best[key] = fam.len_max
-    return [Family(anchor=a, start=i, len_max=L) for (a, i), L in sorted(best.items())]
-
-
-# ----------------------------- Plans & caching ----------------------------- #
-
-
-def normalize_and_plan(
-    families: Sequence[Family], s: int
-) -> Tuple[List[PlanEntry], int]:
-    """
-    Normalize families to a left-anchored, merged plan for word length s.
-
-    Steps:
-      - Convert right-anchored starts to left indices (s - b).
-      - Drop out-of-bounds; clip len_max to not exceed word end.
-      - Merge by identical start (keep the largest len_max).
-      - Sort by start.
-
-    Returns:
-      (plan_entries, skipped_count)
-    """
-    skipped = 0
-    candidates: Dict[int, int] = {}  # start -> len_max (max)
-
-    for fam in families:
-        if fam.anchor == "L":
-            start_idx = fam.start
-        else:  # 'R'
-            start_idx = s - fam.start
-
-        # Drop if out of bounds
-        if start_idx < 0 or start_idx >= s:
-            skipped += 1
+def parse_rules_inline(rules: Sequence[str]) -> List[Directive]:
+    out: List[Directive] = []
+    for r in rules:
+        if not r.strip():
             continue
-
-        cap = s - start_idx
-        if cap <= 0:
-            skipped += 1
-            continue
-
-        eff_len = min(fam.len_max, cap)  # cap the eff_len to start_idx + max_len
-        if eff_len <= 0:
-            skipped += 1
-            continue
-
-        prev = candidates.get(start_idx)
-        if prev is None or eff_len > prev:
-            candidates[start_idx] = eff_len
-
-    plan = [PlanEntry(start=k, len_max=v) for k, v in sorted(candidates.items())]
-    return plan, skipped
+        out.append(parse_directive(r))
+    return out
 
 
-class PlanCache:
-    """
-    Cache of normalized plans keyed by word length.
-
-    Uses separate instances for w1 and w2 because compile-time families can
-    differ by target.
-    """
-
-    def __init__(self, families: Sequence[Family]) -> None:
-        self._families: List[Family] = list(families)
-        self._cache: Dict[int, List[PlanEntry]] = {}
-        self.skipped_spans_for_length: Dict[int, int] = {}
-
-    def get(self, s: int) -> Tuple[List[PlanEntry], bool, int]:
-        """
-        Get or build the plan for length s.
-
-        Returns:
-            (plan, cache_hit, skipped_count_for_this_build)
-        """
-        if s in self._cache:
-            return self._cache[s], True, 0
-        plan, skipped = normalize_and_plan(self._families, s)
-        self._cache[s] = plan
-        self.skipped_spans_for_length[s] = skipped
-        return plan, False, skipped
-
-
-# ------------------------------ Uppercasing -------------------------------- #
-
-
-def _apply_uppercase_mask(word: str, start: int, span_len: int, mask_bits: int) -> str:
-    """
-    Apply a bitmask to uppercase within a contiguous span.
-
-    For i in [0..span_len-1], if the i-th bit of mask_bits is 1, uppercase
-    character at position (start + i). Positions outside the span are unchanged.
-    """
-    if span_len <= 0:
-        return word
-    # Convert to list for efficient per-char mutation
-    chars = list(word)
-    for i in range(span_len):
-        if (mask_bits >> i) & 1:
-            idx = start + i
-            # Bounds are guaranteed by plan construction, but guard anyway
-            if 0 <= idx < len(chars):
-                chars[idx] = chars[idx].upper()
-    return "".join(chars)
-
-
-def enumerate_variants(word: str, plan: Sequence[PlanEntry]) -> tuple[List[str], int]:
-    """
-    Enumerate capitalization variants per the normalized plan using bitmasks.
-
-    Semantics:
-      For each entry (start, len_max), emit ALL case permutations across that span:
-      masks 0..(2^len_max - 1). Mask 0 (no uppercase) is included.
-
-    Deterministic order:
-      - Iterate entries in ascending start (as sorted in the plan),
-      - For each entry, iterate mask_bits ascending (0..2^len_max - 1).
-      - First time a concrete variant appears, it is emitted; later duplicates are
-        suppressed but counted.
-
-    Returns:
-      (variants, duplicates_suppressed_within_word)
-    """
-    out: List[str] = []
-    seen: set[str] = set()
-    suppressed = 0
-
-    for entry in plan:
-        span_len = entry.len_max
-        # Enumerate all masks over this span
-        limit = 1 << span_len  # 2^span_len
-        for mask_bits in range(limit):
-            v = _apply_uppercase_mask(word, entry.start, span_len, mask_bits)
-            if v in seen:
-                suppressed += 1
+def parse_rules_file(path: Path) -> List[Directive]:
+    out: List[Directive] = []
+    with path.open("r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
                 continue
-            seen.add(v)
-            out.append(v)
-
-    return out, suppressed
-
-
-# ------------------------------- Seen stores ------------------------------- #
+            try:
+                out.append(parse_directive(s))
+            except typer.BadParameter as e:
+                raise typer.BadParameter(f"{path}:{ln}: {e}") from None
+    return out
 
 
-class SeenStore:
-    """Interface for stream-safe candidate deduplication."""
-
-    def check_and_add(self, candidate: str) -> bool:
-        """
-        Return True if the candidate is newly added (not seen before).
-        Return False if it has already been seen.
-        """
-        raise NotImplementedError()
-
-    def close(self) -> None:
-        """Close resources (if any)."""
-        pass
+# ---------- Planning / binding ----------
 
 
-class MemorySeenStore(SeenStore):
-    """In-memory set-based seen store."""
+def _bind_span(word_len: int, start: int, length: int) -> Tuple[int, int]:
+    """
+    Convert (start,length) into absolute [i, i+length) over word_len.
+    Negative start counts from right; -1 is last char.
+    Raises ValueError if the span falls outside the word.
+    """
+    if start < 0:
+        i = word_len + start  # e.g., len=5, start=-1 -> i=4
+    elif start == 0:
+        raise ValueError(
+            "Invalid START=0 is invalid. 1 represents the first character from the left.\n"
+            "Negative positions count from the right (-1 represents the last character)."
+        )
+    else:
+        i = start - 1  # convert to 1-based
+    j = i + length
+    if i < 0 or j > word_len:
+        raise ValueError(
+            f"Span out of range for word length {word_len}: start={start}, len={length} -> [{i},{j})"
+        )
+    return (i, length)
+
+
+def build_span_plan(
+    directives: Sequence[Directive],
+    w1_len: int,
+    w2_len: int,
+) -> DirectiveFamily:
+    """
+    Build a normalized, absolute-span plan for op='U' across w1 and w2.
+    Returns a DirectiveFamily consolidating spans per word.
+    """
+    spans_w1: List[Tuple[int, int]] = []
+    spans_w2: List[Tuple[int, int]] = []
+    for d in directives:
+        if d.op != "U":
+            # Currently only U is supported, but keep structure for future ops.
+            continue
+        targets = []
+        if d.wordsel in ("w1", "w*"):
+            targets.append(("w1", w1_len))
+        if d.wordsel in ("w2", "w*"):
+            targets.append(("w2", w2_len))
+        for label, wlen in targets:
+            try:
+                abs_span = _bind_span(wlen, d.start, d.length)
+            except ValueError as e:
+                raise typer.BadParameter(str(e))
+            if label == "w1":
+                spans_w1.append(abs_span)
+            else:
+                spans_w2.append(abs_span)
+
+    spans_w1 = coalesce_directive_families(spans_w1)
+    spans_w2 = coalesce_directive_families(spans_w2)
+    return DirectiveFamily(op="U", spans_w1=tuple(spans_w1), spans_w2=tuple(spans_w2))
+
+
+def coalesce_directive_families(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """
+    Merge identical/overlapping/adjacent spans to reduce redundancy.
+    Input/Output spans are (start, length) with absolute indices.
+    """
+    if not spans:
+        return []
+    # Convert to intervals [a,b)
+    intervals = sorted(
+        ((s, s + length) for (s, length) in spans), key=lambda x: (x[0], x[1])
+    )
+    merged: List[Tuple[int, int]] = []
+    cur_a, cur_b = intervals[0]
+    for a, b in intervals[1:]:
+        if a <= cur_b:  # overlap or touch
+            cur_b = max(cur_b, b)
+        else:
+            merged.append((cur_a, cur_b))
+            cur_a, cur_b = a, b
+    merged.append((cur_a, cur_b))
+    # Back to (start, length)
+    return [(a, b - a) for (a, b) in merged]
+
+
+# ---------- Execution engine ----------
+
+
+class SpanPlanCache:
+    """
+    Cache built plans keyed by (w1_len, w2_len, signature).
+    Signature is a hashable tuple of directives.
+    """
 
     def __init__(self) -> None:
-        self._seen: set[str] = set()
+        self._cache: dict[Tuple[int, int, Tuple[Directive, ...]], DirectiveFamily] = {}
 
-    def check_and_add(self, candidate: str) -> bool:
-        if candidate in self._seen:
-            return False
-        self._seen.add(candidate)
-        return True
+    def get(
+        self, w1_len: int, w2_len: int, directives: Sequence[Directive]
+    ) -> DirectiveFamily:
+        key = (w1_len, w2_len, tuple(directives))
+        if key not in self._cache:
+            self._cache[key] = build_span_plan(directives, w1_len, w2_len)
+        return self._cache[key]
 
 
-class SqliteSeenStore(SeenStore):
+def _permute_case(word: str, spans: Sequence[Tuple[int, int]]) -> Iterator[str]:
     """
-    SQLite-backed seen store (std lib only). Suitable for large runs and reuse across sessions.
-
-    The database contains a single table:
-      CREATE TABLE IF NOT EXISTS seen (candidate TEXT PRIMARY KEY);
+    For a single word, generate all case permutations over the union of spans.
+    Non-span characters pass through unchanged.
     """
+    if not spans:
+        yield word
+        return
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._conn = sqlite3.connect(str(path))
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS seen (candidate TEXT PRIMARY KEY);")
-        self._conn.commit()
+    # Build a mask of indices that are part of any span.
+    mask = [False] * len(word)
+    for start, length in spans:
+        for i in range(start, start + length):
+            mask[i] = True
 
-    def check_and_add(self, candidate: str) -> bool:
-        try:
-            with self._conn:  # implicit transaction per insert
-                self._conn.execute("INSERT INTO seen(candidate) VALUES (?)", (candidate,))
-            return True
-        except sqlite3.IntegrityError:
-            # Already present
-            return False
+    # Collect indices to toggle
+    toggle_idxs = [i for i, m in enumerate(mask) if m]
+    if not toggle_idxs:
+        yield word
+        return
 
-    def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+    # For each combination, build the variant
+    base = list(word)
+    n = len(toggle_idxs)
+    for bits in range(1 << n):
+        w = base[:]
+        for k, idx in enumerate(toggle_idxs):
+            c = w[idx]
+            # For 'U', we generate *both* cases across the span via bitmask.
+            if ((bits >> k) & 1) == 1:
+                w[idx] = c.upper()
+            else:
+                w[idx] = c.lower()
+        yield "".join(w)
 
 
-# --------------------------------- Logging --------------------------------- #
+def apply_family_to_pair(
+    w1: str, w2: str, fam: DirectiveFamily
+) -> Iterator[Tuple[str, str]]:
+    """Apply a DirectiveFamily (currently op='U') to (w1, w2)."""
+    if fam.op != "U":
+        return
+    for v1 in _permute_case(w1, fam.spans_w1):
+        for v2 in _permute_case(w2, fam.spans_w2):
+            yield (v1, v2)
 
 
-def log_plan(
-    target: str, s: int, plan: Sequence[PlanEntry], status: str, skipped: int
-) -> None:
-    """
-    Human-friendly plan log to stderr, printed when a plan is BUILT or on CACHE_HIT if verbose.
-    """
-    print(
-        f"[caps-plan] target={target} len={s} status={status} entries={len(plan)} skipped_spans={skipped}",
-        file=sys.stderr,
-    )
-    for entry in plan:
-        # Visual mask with '@' for max_len at this start
-        mask = ["." for _ in range(s)]
-        for i in range(entry.start, entry.start + entry.len_max):
-            if 0 <= i < s:
-                mask[i] = "@"
-        mask_str = "".join(mask)
-        print(
-            f'  - start={entry.start} span_len={entry.len_max} mask="{mask_str}" '
-            f'masks=2^{entry.len_max} ({1<<entry.len_max} variants)',
-            file=sys.stderr,            
+# ---------- Dedup / persistence ----------
+
+
+def ensure_db(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS seen (candidate TEXT PRIMARY KEY)")
+    conn.commit()
+
+
+def seen_add_many(conn: sqlite3.Connection, cands: Iterable[str]) -> None:
+    with conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO seen(candidate) VALUES (?)", ((c,) for c in cands)
         )
 
 
-# ---------------------------------- CLI ------------------------------------ #
+def seen_filter_new(conn: sqlite3.Connection, cands: Iterable[str]) -> Iterator[str]:
+    # Efficient membership test via LEFT JOIN approach is overkill here; simple SELECT works fine batch-wise.
+    cur = conn.cursor()
+    for c in cands:
+        cur.execute("SELECT 1 FROM seen WHERE candidate=?", (c,))
+        if cur.fetchone():
+            continue
+        yield c
 
-app = typer.Typer(add_completion=False, help="nd_case — patterned capitalization generator.")
+
+# ---------- CLI ----------
 
 
-def _open_in(path: Optional[Path]) -> Iterable[str]:
+def _open_in(path: Optional[Path]):
     if path is None:
         return sys.stdin
-    return path.open("r", encoding="utf-8", errors="strict")
+    return open(path, "r", encoding="utf-8")
 
 
 def _open_out(path: Optional[Path]):
     if path is None:
         return sys.stdout
-    return path.open("w", encoding="utf-8", errors="strict")
-
-
-def _validate_word(token: str) -> bool:
-    return bool(token) and token.isascii() and token.islower() and token.isalpha()
-
-
-def _process_line(
-    line: str,
-    line_index: int,
-    plan_w1: List[PlanEntry],
-    plan_w2: List[PlanEntry],
-    outfh,
-    stats: Stats,
-    stats_only: bool,
-    seen: Optional[SeenStore],
-) -> None:
-    stats.lines_total += 1
-    line = line.strip()
-    if not line:
-        stats.lines_invalid += 1
-        return
-
-    parts = line.split()
-    if len(parts) != 2 or not _validate_word(parts[0]) or not _validate_word(parts[1]):
-        stats.lines_invalid += 1
-        return
-
-    stats.lines_valid += 1
-    w1, w2 = parts[0], parts[1]
-
-    # Build variants deterministically
-    if plan_w1:
-        variants_w1, sup1 = enumerate_variants(w1, plan_w1)
-        stats.duplicates_suppressed += sup1
-    else:
-        variants_w1 = [w1]
-
-    if plan_w2:
-        variants_w2, sup2 = enumerate_variants(w2, plan_w2)
-        stats.duplicates_suppressed += sup2
-    else:
-        variants_w2 = [w2]
-
-    # Cross product emission
-    emitted_this_line = 0
-    for v1 in variants_w1:
-        for v2 in variants_w2:
-            candidate = f"{v1} {v2}"
-            # Seen-store gating
-            if seen is not None:
-                if not seen.check_and_add(candidate):
-                    stats.duplicates_suppressed += 1
-                    continue
-            if not stats_only:
-                print(candidate, file=outfh)
-            emitted_this_line += 1
-
-    if emitted_this_line > stats.max_variants_per_line:
-        stats.max_variants_per_line = emitted_this_line
-        stats.max_variants_line_index = line_index
-
-    stats.variants_total_emitted += emitted_this_line
+    return open(path, "w", encoding="utf-8")
 
 
 @app.command()
 def run(
     rules: List[str] = typer.Argument(
-        ..., metavar="RULE ...", help="One or more directives like 'U(1,5)' or 'w1:U(-3,2)'."
+        None,
+        metavar="RULE ...",
+        help="One or more directives like 'U:1,3' or 'w1:U:-3,2'.",
+    ),
+    rule_opt: List[str] = typer.Option(
+        None,
+        "--rule",
+        "-r",
+        help="Add a directive (repeatable), e.g., -r U:1,3 -r w1:U:-2,2",
+    ),
+    rules_file: Optional[Path] = typer.Option(
+        None,
+        "--rules-file",
+        help="Load directives from a file (one per line). Lines starting with '#' are comments.",
     ),
     infile: Optional[Path] = typer.Option(
-        None, "--in", "-i", exists=True, file_okay=True, dir_okay=False, readable=True, help="Input file (default: stdin)."
+        None, "--in", "-i", help="Input file (default: stdin)."
     ),
     outfile: Optional[Path] = typer.Option(
-        None, "--out", "-o", writable=True, help="Output file (default: stdout)."
+        None, "--out", "-o", help="Output file (default: stdout)."
     ),
-    stats_only: bool = typer.Option(
-        False, "--stats-only", help="Do not emit candidates; compute and print JSON stats to stdout."
-    ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging to stderr."),
     dedup_memory: bool = typer.Option(
         False, "--dedup-memory", help="Enable in-run memory dedup (per-process set)."
     ),
@@ -515,120 +351,87 @@ def run(
         "--seen-db",
         help="SQLite file for persistent dedup/progress. Candidates already present will NOT be re-emitted.",
     ),
-) -> None:
+):
     """
     Generate capitalization variants for two-word pairs using the DSL.
-
-    DSL:
-      RULE := [w1:|w2:]U(start,len)
-        - If no target prefix is given, the directive applies to BOTH words.
-        - start >= 0 counts from the left; start < 0 counts from the right (−1 is last char).
-        - len >= 1; the rule generates ALL case permutations within that span (2^len variants).
-
-    Examples:
-      nd-caps 'U(0,1)'                 # Uppercase first letter of both words
-      nd-caps 'w1:U(1,3)' 'w2:U(-2,2)' # Separate targets
-      nd-caps 'U(1,5)'                 # Both words; lengths 1..5 starting at index 1 (or from right when negative)
     """
-    t0 = time.perf_counter()
-    # Parse and expand rules
-    try:
-        parsed = [parse_rule(r) for r in rules]
-    except CLIError as e:
-        raise typer.BadParameter(str(e)) from e
-
-    fam_w1_raw, fam_w2_raw = expand_targets(parsed)
-    fam_w1 = collapse_families(fam_w1_raw)
-    fam_w2 = collapse_families(fam_w2_raw)
-
-    # Plan caches per target
-    cache_w1 = PlanCache(fam_w1)
-    cache_w2 = PlanCache(fam_w2)
-
-    # Seen store selection
-    seen: Optional[SeenStore] = None
-    try:
-        if seen_db is not None:
-            seen = SqliteSeenStore(seen_db)
-        elif dedup_memory:
-            seen = MemorySeenStore()
-    except Exception as e:
-        raise typer.Exit(code=2) from e
-
-    stats = Stats()
-
-    # IO
-    in_stream = _open_in(infile)
-    out_stream = _open_out(outfile)
-
-    try:
-        for idx, line in enumerate(in_stream):
-            # Compute plans for each word length
-            # We only build/log when a new length is encountered.
-            # Note: we parse words first to avoid computing on invalid lines.
-            raw = line.strip()
-            parts = raw.split()
-            # Fast path: if invalid, let _process_line account for it.
-            s1 = len(parts[0]) if len(parts) == 2 and _validate_word(parts[0]) else 0
-            s2 = len(parts[1]) if len(parts) == 2 and _validate_word(parts[1]) else 0
-
-            plan1, hit1, skipped1 = cache_w1.get(s1) if s1 > 0 else ([], True, 0)
-            plan2, hit2, skipped2 = cache_w2.get(s2) if s2 > 0 else ([], True, 0)
-
-            if not hit1 and verbose:
-                log_plan("w1", s1, plan1, "BUILT", skipped1)
-                stats.plans_built += 1
-            elif hit1 and verbose and s1 > 0:
-                log_plan("w1", s1, plan1, "CACHE_HIT", 0)
-                stats.plans_cache_hits += 1
-
-            if not hit2 and verbose:
-                log_plan("w2", s2, plan2, "BUILT", skipped2)
-                stats.plans_built += 1
-            elif hit2 and verbose and s2 > 0:
-                log_plan("w2", s2, plan2, "CACHE_HIT", 0)
-                stats.plans_cache_hits += 1
-
-            stats.skipped_spans += skipped1 + skipped2
-
-            _process_line(
-                line=line,
-                line_index=idx,
-                plan_w1=plan1,
-                plan_w2=plan2,
-                outfh=out_stream,
-                stats=stats,
-                stats_only=stats_only,
-                seen=seen,
+    # Gather and parse rules
+    collected: List[str] = []
+    if rules:
+        collected.extend(rules)
+    if rule_opt:
+        collected.extend(rule_opt)
+    if rules_file:
+        parsed = parse_rules_file(rules_file)
+    else:
+        if not collected:
+            raise typer.BadParameter(
+                "At least one RULE or --rule/--rules-file is required."
             )
+        parsed = parse_rules_inline(collected)
+
+    # Read input & write output
+    cache = SpanPlanCache()
+    memory_seen: set[str] = set() if dedup_memory else set()
+
+    # Setup DB if requested
+    conn: Optional[sqlite3.Connection] = None
+    writer = _open_out(outfile)
+    try:
+        if seen_db:
+            conn = sqlite3.connect(seen_db)
+            ensure_db(conn)
+
+        with _open_in(infile) as reader:
+            for line_num, line in enumerate(reader, 1):
+                s = line.strip()
+                if not s:
+                    continue
+                parts = s.split()
+                if len(parts) != 2:
+                    raise typer.BadParameter(
+                        f"Input line {line_num}: expected exactly two whitespace-separated words, got: '{s}'"
+                    )
+                w1, w2 = parts[0], parts[1]
+                fam = cache.get(len(w1), len(w2), parsed)
+
+                # Generate candidates and serialize as "w1 w2"
+                gen_iter = (
+                    "{} {}".format(a, b) for (a, b) in apply_family_to_pair(w1, w2, fam)
+                )
+
+                # Dedup in-memory
+                if dedup_memory:
+                    gen_iter = (c for c in gen_iter if c not in memory_seen)
+
+                # Dedup via DB
+                if conn is not None:
+                    gen_iter = seen_filter_new(conn, gen_iter)
+
+                batch: List[str] = []
+                for cand in gen_iter:
+                    if dedup_memory:
+                        memory_seen.add(cand)
+                    batch.append(cand)
+
+                    # Periodic flush to DB to avoid memory growth
+                    if conn is not None and len(batch) >= 1000:
+                        seen_add_many(conn, batch)
+                        writer.write("\n".join(batch) + "\n")
+                        writer.flush()
+                        batch.clear()
+
+                if conn is not None and batch:
+                    seen_add_many(conn, batch)
+
+                if batch:
+                    writer.write("\n".join(batch) + "\n")
 
     finally:
-        if out_stream is not sys.stdout:
-            out_stream.close()
-        if seen is not None:
-            seen.close()
-
-    stats.duration_ms = (time.perf_counter() - t0) * 1000.0
-
-    if stats_only:
-        # Print JSON stats to stdout (not stderr) and exit with 0
-        result = {
-            "lines_total": stats.lines_total,
-            "lines_valid": stats.lines_valid,
-            "lines_invalid": stats.lines_invalid,
-            "variants_total_emitted": stats.variants_total_emitted,
-            "max_variants_per_line": stats.max_variants_per_line,
-            "max_variants_line_index": stats.max_variants_line_index,
-            "skipped_spans": stats.skipped_spans,
-            "duplicates_suppressed": stats.duplicates_suppressed,
-            "plans_built": stats.plans_built,
-            "plans_cache_hits": stats.plans_cache_hits,
-            "duration_ms": round(stats.duration_ms, 3),
-        }
-        # If stdout was redirected to a file via --out, we must still write stats to stdout.
-        # So ensure we print here (stdout).
-        print(json.dumps(result, ensure_ascii=False))
-    # Otherwise, normal emission already written to out_stream
+        if writer is not sys.stdout:
+            writer.close()
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":
