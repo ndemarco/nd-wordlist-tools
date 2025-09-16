@@ -136,7 +136,14 @@ def _bind_span(word_len: int, start: int, length: int) -> Tuple[int, int]:
     Raises ValueError if the span falls outside the word.
     """
     if start < 0:
-        i = word_len + start  # e.g., len=5, start=-1 -> i=4
+        # -1 means last char, -2 second to last, etc. For length > 1, span should cover up to 'length' chars ending at last char.
+        end = word_len  # exclusive
+        begin = max(0, end - length)
+        if begin >= end:
+            raise ValueError(
+                f"Span out of range for word length {word_len}: start={start}, len={length} -> [{begin},{end})"
+            )
+        return (begin, end - begin)
     elif start == 0:
         raise ValueError(
             "Invalid START=0 is invalid. 1 represents the first character from the left.\n"
@@ -144,12 +151,12 @@ def _bind_span(word_len: int, start: int, length: int) -> Tuple[int, int]:
         )
     else:
         i = start - 1  # convert to 1-based
-    j = i + length
-    if i < 0 or j > word_len:
-        raise ValueError(
-            f"Span out of range for word length {word_len}: start={start}, len={length} -> [{i},{j})"
-        )
-    return (i, length)
+        j = min(i + length, word_len)
+        if i < 0 or i >= word_len:
+            raise ValueError(
+                f"Span out of range for word length {word_len}: start={start}, len={length} -> [{i},{j})"
+            )
+        return (i, j - i)
 
 
 def build_span_plan(
@@ -432,6 +439,10 @@ def run(
             writer.close()
         if conn is not None:
             conn.close()
+
+
+def main():
+    typer.run(run)
 
 
 if __name__ == "__main__":

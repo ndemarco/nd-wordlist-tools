@@ -22,9 +22,6 @@ ndcombine --pairs pairs.txt --fills fills.txt > out.txt
 # Fills from stdin
 cat fills.txt | ndcombine -p pairs.txt -f - > out.txt
 
-# Stats only (don’t print candidates, just count)
-ndcombine -p pairs.txt -f fills.txt --stats-only
-
 DESIGN
 ------
 - Pair lines must contain exactly two tokens (whitespace-delimited).
@@ -38,27 +35,41 @@ import sys
 from typing import Iterator, List, Optional, TextIO
 import typer
 
-app = typer.Typer(add_completion=False, help="Insert fills between word pairs (w1 w2 → w1 + fill + w2).")
+app = typer.Typer(
+    add_completion=False,
+    help="Insert fills between word pairs (w1 w2 → w1 + fill + w2).",
+)
+
 
 def _read_lines(f: TextIO) -> Iterator[str]:
     for raw in f:
         yield raw.rstrip("\n\r")
+
 
 def _read_nonblank(f: TextIO) -> Iterator[str]:
     for s in _read_lines(f):
         if s != "":
             yield s
 
+
 def _load_fills(f: TextIO) -> List[str]:
     return list(_read_nonblank(f))
 
-@app.command()
-def main(
-    pairs: typer.FileText = typer.Option(..., "--pairs", "-p", help="File of word pairs: 'w1 w2' per line (use '-' for stdin)"),
-    fills: typer.FileText = typer.Option(..., "--fills", "-f", help="File of fills (one per line; use '-' for stdin)"),
-    out: Optional[typer.FileTextWrite] = typer.Option(None, "--out", "-o", help="Output file (default: stdout)"),
 
-    stats_only: bool = typer.Option(False, "--stats-only", help="Print only the total candidate count"),
+@app.command()
+def run(
+    pairs: typer.FileText = typer.Option(
+        ...,
+        "--pairs",
+        "-p",
+        help="File of word pairs: 'w1 w2' per line (use '-' for stdin)",
+    ),
+    fills: typer.FileText = typer.Option(
+        ..., "--fills", "-f", help="File of fills (one per line; use '-' for stdin)"
+    ),
+    out: Optional[typer.FileTextWrite] = typer.Option(
+        None, "--out", "-o", help="Output file (default: stdout)"
+    ),
 ) -> None:
     """
     Insert all fills between each pair line (w1 w2).
@@ -67,8 +78,6 @@ def main(
 
     fills_list = _load_fills(fills)
     if not fills_list:
-        if stats_only:
-            typer.echo("0")
         return
 
     total = 0
@@ -79,21 +88,21 @@ def main(
 
         parts = line.split()
         if len(parts) != 2:
-            typer.echo(f"error: invalid pair line (expected 2 tokens): {line}", err=True)
+            typer.echo(
+                f"error: invalid pair line (expected 2 tokens): {line}", err=True
+            )
             raise typer.Exit(code=1)
 
         w1, w2 = parts
-
-        if stats_only:
-            total += len(fills_list)
-            continue
 
         for fill in fills_list:
             writer.write(f"{w1}{fill}{w2}\n")
             total += 1
 
-    if stats_only:
-        typer.echo(str(total))
+
+def main() -> None:
+    app()
+
 
 if __name__ == "__main__":
     app()

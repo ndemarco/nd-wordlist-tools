@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-import sys
-from itertools import product
-from typing import Iterator, List, Tuple, Optional
 
+from typing import Iterator, List, Tuple, Optional
 import typer
 from typer import FileText
 
-app = typer.Typer()
+cli = typer.Typer(add_completion=False)
 
-Pattern = str  # could be Literal["AB", "BA", "AA"] in Python 3.8+
+Pattern = str  # e.g. Literal["AB", "BA", "AA"]
+
 
 def generate_pairs(
     base: List[str],
@@ -25,8 +24,7 @@ def generate_pairs(
     with all base words first, then extra words.
 
     Avoid emitting duplicates. If extra corpus is given: only yield pairs where at least
-      one word comes from the extra corpus.
-   
+    one word comes from the extra corpus.
     """
     if extra:
         combined = base + extra
@@ -37,63 +35,76 @@ def generate_pairs(
         base_set = set(base)
         extra_set = set()  # unused in single-corpus mode
 
-    for pattern in patterns:
-        if pattern == "AB":
+    # Drop duplicates while preserving order.
+    # `raw` preserves original case for error reporting
+    for raw in dict.fromkeys(patterns):
+        p = raw.upper()
+        if p == "AB":
             for i, w1 in enumerate(combined):
-                for w2 in combined[i+1:]:
+                for w2 in combined[i + 1 :]:
                     if extra and (w1 in base_set and w2 in base_set):
                         continue  # skip base-only pairs
                     yield (w1, w2)
 
-        elif pattern == "BA":
+        elif p == "BA":
             for i, w1 in enumerate(combined):
-                for w2 in combined[i+1:]:
+                for w2 in combined[i + 1 :]:
                     if extra and (w1 in base_set and w2 in base_set):
                         continue
                     yield (w2, w1)
 
-        elif pattern == "AA":
+        elif p == "AA":
             for w in combined:
                 if extra and (w in base_set and w not in extra_set):
                     continue  # skip base-only self-pairs
                 yield (w, w)
 
         else:
-            raise ValueError(f"Unknown pattern: {pattern}")
+            raise ValueError(f"Unknown pattern: {raw}")
 
 
-@app.command()
-def main(
-    base_corpus: FileText = typer.Option(
-        sys.stdin, "--base-corpus", "-a",
-        help="Base corpus file (default: stdin)"
+@cli.command()
+def run(
+    in_file: FileText = typer.Option(
+        None,
+        "--in-file",
+        "-i",
+        help="Input corpus file ('-' for stdin)",
     ),
     extra_corpus: Optional[FileText] = typer.Option(
-        None, "--extra-corpus", "-e",
-        help="Extra (supplementary) corpus file"
+        None, "--extra-corpus", "-e", help="Supplemental entries to base corpus"
     ),
     patterns: str = typer.Option(
-        "AB", "--patterns", "-p",
-        help="Comma-separated list of patterns: AB,BA,AA"
+        "AB",
+        "--patterns",
+        "-p",
+        help="Comma-separated: AB,BA,AA",
+        show_default=True,
     ),
     unique: bool = typer.Option(
-        False, "--unique", "-u",
-        help="Skip pairs where word1 == word2"
+        False, "--unique", "-u", help="Skip pairs where word1 == word2"
     ),
 ):
     """
-    Add command API to generate word pairs according to the given patterns.
-
-    Produce pairs from base corpus. If an extra corpus is provided, only produce pairs
+    Generate word pairs per patterns. If extra is provided, only produce pairs
     where at least one word is from the extra corpus.
     """
     # Read corpora
-    base_words = [w for line in base_corpus for w in line.strip().split() if w]
+    if in_file is None:
+        # Print Typer's help text and exit with code 0, matching -h/--help
+        from typer.main import get_command
+        import click
+
+        cmd = get_command(cli)
+        ctx = click.Context(cmd)
+        typer.echo(cmd.get_help(ctx))
+        raise typer.Exit(code=0)
+    base_words = [w for line in in_file for w in line.strip().split() if w]
     if not base_words:
-        typer.echo("Error: Base corpus is empty.", err=True)
+        typer.echo("Error: Input corpus is empty.", err=True)
         raise typer.Exit(1)
 
-    extra_words = []
+    extra_words: list[str] = []
     if extra_corpus:
         extra_words = [w for line in extra_corpus for w in line.strip().split() if w]
         if not extra_words:
@@ -101,7 +112,7 @@ def main(
             raise typer.Exit(1)
 
     # Parse patterns
-    pattern_list = [p.strip() for p in patterns.split(",") if p.strip()]
+    pattern_list = [p.strip().upper() for p in patterns.split(",") if p.strip()]
     valid_patterns = {"AB", "BA", "AA"}
     for p in pattern_list:
         if p not in valid_patterns:
@@ -109,7 +120,9 @@ def main(
             raise typer.Exit(1)
 
     # Generate pairs
-    pairs = generate_pairs(base_words, extra_words if extra_words else None, pattern_list)
+    pairs = generate_pairs(
+        base_words, extra_words if extra_words else None, pattern_list
+    )
 
     if unique:
         pairs = ((w1, w2) for w1, w2 in pairs if w1 != w2)
@@ -118,5 +131,9 @@ def main(
         print(f"{w1}\t{w2}")
 
 
+def main() -> None:
+    cli()
+
+
 if __name__ == "__main__":
-    app()
+    main()

@@ -21,7 +21,10 @@ dev = [
 ]
 
 [project.scripts]
-nd_caps = "nd_caps:main"
-nd_num2symbol = "nd_num2symbol:main"
-nd_interpose = "nd_interpose:main"
-nd_permute = "nd_permute:main"
+ndcase = "nd_wordlist_tools.ndcase:main"
+ndcombine = "nd_wordlist_tools.ndcombine:main"
+ndfillgen = "nd_wordlist_tools.ndfillgen:main"
+ndpermute = "nd_wordlist_tools.ndpermute:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nd_wordlist_tools"]
